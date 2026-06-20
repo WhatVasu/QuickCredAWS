@@ -1,0 +1,381 @@
+# QuickCred — Flask MVP Build Prompt (Thin Client)
+
+## What You Are Building
+
+A peer-to-peer student lending web application called **QuickCred**. Flask is a thin frontend — it renders HTML and calls your existing AWS API Gateway endpoints via `requests`. All business logic, validation, and data storage already lives in your Lambda + DynamoDB backend. Flask only handles sessions, auth UI, and page rendering.
+
+---
+
+## Tech Stack
+
+- **Backend:** Python, Flask
+- **Data layer:** `requests` calls to existing API Gateway — NO SQLAlchemy, NO SQLite, NO models.py
+- **Auth:** Flask-Login + server-side sessions. On login, verify credentials by calling `GET /api/users` and matching email/password. Store `userId`, `name`, `email` in session.
+- **Password storage:** Since the existing User Lambda doesn't handle passwords, add a `password` field when calling `POST /api/users` and store a bcrypt hash of it as a new attribute. Retrieve and verify it on login.
+- **Templates:** Jinja2 with Bootstrap 5 CDN — no custom CSS
+- **No:** SQLAlchemy, SQLite, Celery, Redis, Docker, Gunicorn, models.py
+
+Install: `pip install flask flask-login flask-bcrypt requests`
+
+---
+
+## API Base URL
+
+```python
+BASE_URL = "https://d3nvtc3it8.execute-api.us-east-1.amazonaws.com"
+```
+
+All data calls go through this. Never query DynamoDB directly.
+
+---
+
+## Project Structure
+
+```
+quickcred/
+├── app.py
+├── api.py               # all requests to API Gateway — one place
+├── routes/
+│   ├── auth.py
+│   ├── loans.py
+│   ├── repayments.py
+│   └── notifications.py
+└── templates/
+    ├── base.html
+    ├── auth/
+    │   ├── login.html
+    │   └── register.html
+    └── dashboard/
+        ├── home.html
+        ├── loans.html
+        ├── loan_detail.html
+        ├── my_loans.html
+        ├── repayments.html
+        ├── credit_score.html
+        └── notifications.html
+```
+
+---
+
+## api.py — Central API Client
+
+All HTTP calls to the backend live here. Routes import from this file — never call `requests` directly in route handlers.
+
+```python
+# api.py
+import requests
+
+BASE_URL = "https://d3nvtc3it8.execute-api.us-east-1.amazonaws.com"
+
+def _url(path):
+    return f"{BASE_URL}{path}"
+
+# ── Users ─────────────────────────────────────────────────────────────────────
+
+def create_user(name, email, college, department, year, password_hash):
+    return requests.post(_url("/api/users"), json={
+        "name": name,
+        "email": email,
+        "college": college,
+        "department": department,
+        "year": year,
+        "password": password_hash    # stored as extra field in DynamoDB
+    })
+
+def get_users():
+    return requests.get(_url("/api/users")).json()
+
+def get_user(user_id):
+    return requests.get(_url(f"/api/users/{user_id}")).json()
+
+# ── Loans ─────────────────────────────────────────────────────────────────────
+
+def get_loans():
+    return requests.get(_url("/api/loans")).json()
+
+def get_loan(loan_id):
+    return requests.get(_url(f"/api/loans/{loan_id}")).json()
+
+def create_loan(borrower_id, borrower_email, amount, interest):
+    return requests.post(_url("/api/loans"), json={
+        "borrowerId": borrower_id,
+        "borrowerEmail": borrower_email,
+        "amount": amount,
+        "interest": interest
+    })
+
+def update_loan(loan_id, amount, interest, status):
+    return requests.put(_url(f"/api/loans/{loan_id}"), json={
+        "amount": amount,
+        "interest": interest,
+        "status": status
+    })
+
+def fund_loan(loan_id, lender_id, lender_email):
+    return requests.put(_url(f"/api/loans/{loan_id}/fund"), json={
+        "lenderId": lender_id,
+        "lenderEmail": lender_email
+    })
+
+def delete_loan(loan_id):
+    return requests.delete(_url(f"/api/loans/{loan_id}"))
+
+# ── Repayments ────────────────────────────────────────────────────────────────
+
+def get_repayments():
+    return requests.get(_url("/api/repayments")).json()
+
+def create_repayment(loan_id, borrower_id, borrower_email, amount, due_date):
+    return requests.post(_url("/api/repayments"), json={
+        "loanId": loan_id,
+        "borrowerId": borrower_id,
+        "borrowerEmail": borrower_email,
+        "amount": amount,
+        "dueDate": due_date
+    })
+
+def update_repayment(repayment_id, amount, status):
+    return requests.put(_url(f"/api/repayments/{repayment_id}"), json={
+        "amount": amount,
+        "status": status
+    })
+
+def delete_repayment(repayment_id):
+    return requests.delete(_url(f"/api/repayments/{repayment_id}"))
+
+# ── Credit Score ──────────────────────────────────────────────────────────────
+
+def get_credit_score(user_id):
+    return requests.get(_url(f"/api/creditscores/{user_id}")).json()
+
+# ── Notifications ─────────────────────────────────────────────────────────────
+
+def get_notifications():
+    return requests.get(_url("/api/notifications")).json()
+
+def create_notification(user_id, message):
+    return requests.post(_url("/api/notifications"), json={
+        "userId": user_id,
+        "message": message
+    })
+```
+
+---
+
+## Auth Design
+
+The existing API has no login endpoint. Handle auth entirely at the Flask level:
+
+### Registration (`POST /register`)
+1. Validate all fields present
+2. Check if email exists: scan `get_users()` and look for matching email → if found, flash "Email already registered"
+3. Hash password with bcrypt: `bcrypt.generate_password_hash(password).decode('utf-8')`
+4. Call `api.create_user(...)` passing the hash as the `password` field
+5. On 201 → flash success, redirect to `/login`
+6. On any error → flash the API's error message
+
+### Login (`POST /login`)
+1. Call `api.get_users()` → find user where `user["email"] == email`
+2. If not found → flash "Invalid email or password"
+3. Retrieve stored `password` hash from the user record
+4. `bcrypt.check_password_hash(user["password"], submitted_password)`
+5. If mismatch → flash "Invalid email or password"
+6. If valid → store in session: `session["userId"]`, `session["name"]`, `session["email"]`
+7. Use Flask-Login's `login_user()` with a minimal `UserSession` object (see below)
+
+### Flask-Login User Object
+
+Since there is no ORM, create a lightweight class:
+
+```python
+# app.py
+from flask_login import UserMixin
+
+class UserSession(UserMixin):
+    def __init__(self, user_id, name, email):
+        self.id    = user_id
+        self.name  = name
+        self.email = email
+
+@login_manager.user_loader
+def load_user(user_id):
+    # Called on every request to restore the current user from session
+    user_data = session.get("user_data")
+    if user_data and user_data["userId"] == user_id:
+        return UserSession(user_data["userId"], user_data["name"], user_data["email"])
+    return None
+```
+
+Store full user dict in `session["user_data"]` on login so `user_loader` can reconstruct without an API call on every request.
+
+---
+
+## Routes
+
+### auth.py
+
+| Method | Path | Action |
+|--------|------|--------|
+| GET | `/register` | Render register form |
+| POST | `/register` | Call `api.create_user`, redirect to `/login` |
+| GET | `/login` | Render login form |
+| POST | `/login` | Verify against API users, start session |
+| GET | `/logout` | `logout_user()`, clear session, redirect `/login` |
+
+---
+
+### loans.py
+
+| Method | Path | Action |
+|--------|------|--------|
+| GET | `/` | Dashboard home — unread notification count, quick links |
+| GET | `/loans` | List all `REQUESTED` loans from API |
+| GET | `/loans/new` | Render loan creation form |
+| POST | `/loans/new` | Call `api.create_loan(...)`, redirect `/my-loans` |
+| GET | `/loans/<id>` | Call `api.get_loan(id)`, render detail page |
+| POST | `/loans/<id>/edit` | Call `api.update_loan(...)` |
+| POST | `/loans/<id>/delete` | Call `api.delete_loan(...)` |
+| POST | `/loans/<id>/fund` | Call `api.fund_loan(...)` |
+
+**In each route handler, check the API response status code and flash the `response.json()["message"]` on any non-2xx. Do not re-implement business logic in Flask — let the API reject and just display the message.**
+
+Example pattern:
+```python
+@loans_bp.route("/loans/<loan_id>/fund", methods=["POST"])
+@login_required
+def fund_loan(loan_id):
+    resp = api.fund_loan(loan_id, current_user.id, current_user.email)
+    if resp.status_code == 200:
+        flash("Loan funded successfully!", "success")
+    else:
+        flash(resp.json().get("message", "Something went wrong"), "danger")
+    return redirect(url_for("loans.browse"))
+```
+
+---
+
+### repayments.py
+
+| Method | Path | Action |
+|--------|------|--------|
+| GET | `/repayments` | List repayments where `borrowerId == current_user.id` (filter client-side from full list) |
+| POST | `/repayments/new` | Call `api.create_repayment(...)` |
+| POST | `/repayments/<id>/update` | Call `api.update_repayment(...)` with new status |
+| POST | `/repayments/<id>/delete` | Call `api.delete_repayment(...)` |
+
+---
+
+### notifications.py
+
+| Method | Path | Action |
+|--------|------|--------|
+| GET | `/notifications` | Fetch all notifications, filter by `userId == current_user.id` client-side |
+| POST | `/notifications/mark-read` | No backend endpoint for this — track read state in Flask session as a set of seen notificationIds |
+
+---
+
+## Pages & What They Show
+
+### `/` — Dashboard
+- "Welcome, {name}"
+- Unread notification count (filter notifications by userId + status == UNREAD)
+- Cards/links: Browse Loans · My Loans · My Repayments · My Credit Score · Notifications
+
+### `/loans` — Browse Loans
+- Table: borrower name, amount, interest, posted date, action
+- Show only `REQUESTED` loans (filter from full list)
+- Hide "Fund" button on own loans
+- "Post a Loan" button at top
+
+### `/loans/new` — Post Loan
+- Form fields: Amount (number), Interest (number)
+- borrowerId and borrowerEmail taken from `current_user` — not shown to user
+
+### `/loans/<id>` — Loan Detail
+- All loan fields displayed
+- If `REQUESTED` and not own loan → Fund button
+- If own loan and `REQUESTED` → Edit form (amount, interest) + Delete button
+- If `FUNDED` → show lender info, lock message
+
+### `/my-loans` — My Loans
+- Section 1: Loans I Borrowed — filter where `borrowerId == current_user.id`
+- Section 2: Loans I Funded — filter where `lenderId == current_user.id`
+- Status badge on each row
+
+### `/repayments` — My Repayments
+- Filter full repayments list by `borrowerId == current_user.id`
+- Status badge: PENDING (yellow) · PAID (green) · DEFAULTED (red)
+- For PENDING rows: "Mark Paid" and "Mark Defaulted" buttons → `POST /repayments/<id>/update`
+
+### `/credit-score` — Credit Score
+- Call `api.get_credit_score(current_user.id)`
+- Display score large (e.g. "72 / 100")
+- Show: successfulRepayments, defaults, completedLoans
+- Formula note: `Base 50 + (repayments × 5) − (defaults × 40)`
+
+### `/notifications` — Notifications
+- Filter all notifications by `userId == current_user.id`
+- Newest first (sort by `createdAt` descending)
+- Unread ones in bold or highlighted
+- "Mark all read" → store all notificationIds in `session["read_notifications"]` set
+
+---
+
+## base.html Requirements
+
+```html
+<!-- Bootstrap 5 CDN only, no custom CSS -->
+<link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+
+<!-- Navbar links (when logged in) -->
+Browse Loans | My Loans | Repayments | Credit Score | Notifications <badge> | Logout
+
+<!-- Flash messages block -->
+{% for category, message in get_flashed_messages(with_categories=true) %}
+  <div class="alert alert-{{ category }} alert-dismissible fade show">{{ message }}</div>
+{% endfor %}
+
+<!-- Content block -->
+{% block content %}{% endblock %}
+```
+
+---
+
+## app.py
+
+```python
+from flask import Flask, session
+from flask_login import LoginManager
+from flask_bcrypt import Bcrypt
+
+app = Flask(__name__)
+app.config['SECRET_KEY'] = 'dev-secret-key-change-later'
+
+bcrypt = Bcrypt(app)
+login_manager = LoginManager(app)
+login_manager.login_view = 'auth.login'
+
+from routes.auth import auth_bp
+from routes.loans import loans_bp
+from routes.repayments import repayments_bp
+from routes.notifications import notifications_bp
+
+app.register_blueprint(auth_bp)
+app.register_blueprint(loans_bp)
+app.register_blueprint(repayments_bp)
+app.register_blueprint(notifications_bp)
+
+if __name__ == '__main__':
+    app.run(debug=True)
+```
+
+---
+
+## Key Rules for Code Generation
+
+1. **Never re-implement business logic in Flask.** All validation (self-funding, funded loan lock, duplicate repayment, etc.) is enforced by the Lambda backend. Flask only checks the HTTP status code and flashes the message.
+2. **All filtering is client-side.** The API has no user-scoped GET endpoints. Fetch the full list and filter in Python before passing to the template.
+3. **No database.** No SQLAlchemy, no SQLite, no db.session, no models. The only persistence is the DynamoDB backend accessed via API calls.
+4. **Flash every API error.** On any non-2xx response, flash `response.json().get("message", "Something went wrong")` with category `"danger"`.
+5. **Use POST for all form actions.** HTML forms only support GET/POST. Use `POST` for edit, delete, fund, mark-paid — no PUT/DELETE from the browser directly.
+6. **Run with:** `python app.py` — no gunicorn, no dotenv required for MVP.
